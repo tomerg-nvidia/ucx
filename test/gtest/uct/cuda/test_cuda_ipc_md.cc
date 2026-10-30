@@ -12,6 +12,7 @@
 
 #include <cuda_runtime.h>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 
 #include <uct/test_md.h>
@@ -28,6 +29,7 @@ extern "C" {
 #include <ucs/datastruct/pgtable.h>
 #include <ucs/debug/memtrack_int.h>
 #include <ucs/sys/ptr_arith.h>
+#include <ucs/sys/sys.h>
 }
 
 class test_cuda_ipc_md : public test_md {
@@ -164,6 +166,40 @@ protected:
         params.field_mask = UCT_MD_MEM_DEREG_FIELD_MEMH;
         params.memh       = memh;
         EXPECT_UCS_OK(md()->ops->mem_dereg(md(), &params));
+    }
+
+    /* The key as another process receives it, so that mapping it goes through
+     * the remote cache rather than the same-process shortcut */
+    static uct_cuda_ipc_extended_rkey_t
+    vmm_multi_remote_key(const uct_cuda_ipc_rkey_t &key)
+    {
+        uct_cuda_ipc_extended_rkey_t rkey = {};
+
+        rkey.super     = key;
+        rkey.super.pid = getpid() + 100000;
+        rkey.pid_ns    = ucs_sys_get_ns(UCS_SYS_NS_TYPE_PID);
+        return rkey;
+    }
+
+    static void vmm_multi_map(uct_cuda_ipc_extended_rkey_t *rkey,
+                              CUdevice cu_dev, void **mapped_p,
+                              uct_cuda_ipc_cache_region_t **region_p)
+    {
+        ASSERT_UCS_OK(uct_cuda_ipc_map_memhandle(rkey, cu_dev, mapped_p,
+                                                 region_p,
+                                                 UCS_LOG_LEVEL_ERROR));
+        ASSERT_TRUE(*region_p != NULL);
+    }
+
+    static void vmm_multi_unmap(const uct_cuda_ipc_extended_rkey_t *rkey,
+                                CUdevice cu_dev, void *mapped,
+                                uct_cuda_ipc_cache_region_t *region,
+                                int cache_enabled)
+    {
+        uct_cuda_ipc_mapping_t mapping;
+
+        uct_cuda_ipc_mapping_init(&mapping, rkey, mapped, region);
+        uct_cuda_ipc_unmap_memhandle(&mapping, cu_dev, cache_enabled);
     }
 
     static std::vector<uint8_t> read_device(const void *ptr, size_t length)
@@ -745,6 +781,157 @@ UCS_TEST_P(test_cuda_ipc_md, vmm_multi_import_without_context)
 #endif
 }
 
+UCS_TEST_P(test_cuda_ipc_md, vmm_multi_view_cache)
+{
+#if HAVE_CUDA_FABRIC
+    constexpr unsigned num_chunks = 3;
+    cuda_fabric_mem_buffer alloc(1, UCS_MEMORY_TYPE_CUDA, num_chunks);
+    uct_cuda_ipc_cache_region_t *region, *hit_region, *sub_region, *new_region;
+    void *mapped, *hit_mapped, *sub_mapped, *new_mapped;
+    uct_cuda_ipc_extended_rkey_t rkey, sub_rkey, new_rkey;
+    uct_cuda_ipc_rkey_t key, sub_key, new_key;
+    std::vector<uint8_t> sent;
+    uct_mem_h memh, new_memh;
+    CUdevice cu_dev;
+
+    if (!uct_cuda_ipc_component.enable_remote_cache) {
+        UCS_TEST_SKIP_R("CUDA IPC cache is disabled");
+    }
+
+    ASSERT_EQ(CUDA_SUCCESS, cuCtxGetDevice(&cu_dev));
+    sent = vmm_multi_fill(alloc);
+    ASSERT_UCS_OK(md()->ops->mem_reg(md(), alloc.ptr(), alloc.size(), NULL,
+                                     &memh));
+    ASSERT_NO_FATAL_FAILURE(vmm_multi_key(memh, alloc.ptr(), alloc.size(),
+                                          &key));
+    ASSERT_NO_FATAL_FAILURE(vmm_multi_key(
+            memh, UCS_PTR_BYTE_OFFSET(alloc.ptr(), alloc.chunk_size()),
+            2 * alloc.chunk_size(), &sub_key));
+    rkey     = vmm_multi_remote_key(key);
+    sub_rkey = vmm_multi_remote_key(sub_key);
+
+    /* A key is served by its cached view */
+    vmm_multi_map(&rkey, cu_dev, &mapped, &region);
+    vmm_multi_map(&rkey, cu_dev, &hit_mapped, &hit_region);
+    EXPECT_EQ(region, hit_region);
+    EXPECT_EQ(mapped, hit_mapped);
+    EXPECT_EQ(vmm_multi_expected(sent, alloc, key),
+              read_device(mapped, key.b_len));
+    vmm_multi_unmap(&rkey, cu_dev, hit_mapped, hit_region, 1);
+
+    /* And so is a narrower key of the same layout, at its offset */
+    vmm_multi_map(&sub_rkey, cu_dev, &sub_mapped, &sub_region);
+    EXPECT_EQ(region, sub_region);
+    EXPECT_EQ(UCS_PTR_BYTE_OFFSET(mapped, alloc.chunk_size()), sub_mapped);
+    EXPECT_EQ(vmm_multi_expected(sent, alloc, sub_key),
+              read_device(sub_mapped, sub_key.b_len));
+    vmm_multi_unmap(&sub_rkey, cu_dev, sub_mapped, sub_region, 1);
+
+    /* Registering the same memory again publishes a new layout, whose key
+     * replaces the view while it is still in use */
+    ASSERT_UCS_OK(md()->ops->mem_reg(md(), alloc.ptr(), alloc.size(), NULL,
+                                     &new_memh));
+    ASSERT_NO_FATAL_FAILURE(vmm_multi_key(new_memh, alloc.ptr(), alloc.size(),
+                                          &new_key));
+    EXPECT_NE(key.ph.buffer_id, new_key.ph.buffer_id);
+    new_rkey = vmm_multi_remote_key(new_key);
+    vmm_multi_map(&new_rkey, cu_dev, &new_mapped, &new_region);
+    EXPECT_NE(region, new_region);
+
+    /* The replaced view stays mapped until its last reference is released */
+    EXPECT_EQ(sent, read_device(mapped, alloc.size()));
+    vmm_multi_unmap(&rkey, cu_dev, mapped, region, 1);
+
+    vmm_multi_map(&new_rkey, cu_dev, &hit_mapped, &hit_region);
+    EXPECT_EQ(new_region, hit_region);
+    EXPECT_EQ(sent, read_device(hit_mapped, alloc.size()));
+
+    /* Drop the cached view before the exported memory is released */
+    vmm_multi_unmap(&new_rkey, cu_dev, hit_mapped, hit_region, 0);
+    vmm_multi_unmap(&new_rkey, cu_dev, new_mapped, new_region, 0);
+    mem_dereg(new_memh);
+    mem_dereg(memh);
+#else
+    UCS_TEST_SKIP_R("built without fabric support");
+#endif
+}
+
+UCS_TEST_P(test_cuda_ipc_md, vmm_multi_view_overlap)
+{
+#if HAVE_CUDA_FABRIC
+    constexpr unsigned num_chunks = 4;
+    cuda_fabric_mem_buffer alloc(1, UCS_MEMORY_TYPE_CUDA, num_chunks);
+    uct_cuda_ipc_cache_region_t *region_a, *region_b, *region_c, *region;
+    void *mapped_a, *mapped_b, *mapped_c, *mapped;
+    uct_cuda_ipc_extended_rkey_t rkey_a, rkey_b, rkey_c;
+    uct_cuda_ipc_rkey_t key_a, key_b, key_c;
+    std::vector<uint8_t> sent;
+    uct_mem_h memh;
+    CUdevice cu_dev;
+
+    if (!uct_cuda_ipc_component.enable_remote_cache) {
+        UCS_TEST_SKIP_R("CUDA IPC cache is disabled");
+    }
+
+    auto chunk = [&](unsigned i) {
+        return UCS_PTR_BYTE_OFFSET(alloc.ptr(), i * alloc.chunk_size());
+    };
+
+    ASSERT_EQ(CUDA_SUCCESS, cuCtxGetDevice(&cu_dev));
+    sent = vmm_multi_fill(alloc);
+    ASSERT_UCS_OK(md()->ops->mem_reg(md(), alloc.ptr(), alloc.size(), NULL,
+                                     &memh));
+
+    /* Packs of one registration for A=[C0,C2], B=[C1,C3] and C=[C0,C3] */
+    ASSERT_NO_FATAL_FAILURE(vmm_multi_key(memh, chunk(0),
+                                          3 * alloc.chunk_size(), &key_a));
+    ASSERT_NO_FATAL_FAILURE(vmm_multi_key(memh, chunk(1),
+                                          3 * alloc.chunk_size(), &key_b));
+    ASSERT_NO_FATAL_FAILURE(vmm_multi_key(memh, chunk(0), alloc.size(),
+                                          &key_c));
+    rkey_a = vmm_multi_remote_key(key_a);
+    rkey_b = vmm_multi_remote_key(key_b);
+    rkey_c = vmm_multi_remote_key(key_c);
+
+    /* Overlapping keys of one layout get their own views, which coexist */
+    vmm_multi_map(&rkey_a, cu_dev, &mapped_a, &region_a);
+    vmm_multi_map(&rkey_b, cu_dev, &mapped_b, &region_b);
+    EXPECT_NE(region_a, region_b);
+    EXPECT_EQ(vmm_multi_expected(sent, alloc, key_a),
+              read_device(mapped_a, key_a.b_len));
+    EXPECT_EQ(vmm_multi_expected(sent, alloc, key_b),
+              read_device(mapped_b, key_b.b_len));
+
+    vmm_multi_map(&rkey_a, cu_dev, &mapped, &region);
+    EXPECT_EQ(region_a, region);
+    EXPECT_EQ(mapped_a, mapped);
+    vmm_multi_unmap(&rkey_a, cu_dev, mapped, region, 1);
+
+    /* A view containing both replaces them, while they stay mapped for the
+     * operations holding them */
+    vmm_multi_map(&rkey_c, cu_dev, &mapped_c, &region_c);
+    EXPECT_NE(region_a, region_c);
+    EXPECT_NE(region_b, region_c);
+    EXPECT_EQ(sent, read_device(mapped_c, key_c.b_len));
+    EXPECT_EQ(vmm_multi_expected(sent, alloc, key_a),
+              read_device(mapped_a, key_a.b_len));
+    EXPECT_EQ(vmm_multi_expected(sent, alloc, key_b),
+              read_device(mapped_b, key_b.b_len));
+
+    vmm_multi_map(&rkey_b, cu_dev, &mapped, &region);
+    EXPECT_EQ(region_c, region);
+    EXPECT_EQ(UCS_PTR_BYTE_OFFSET(mapped_c, alloc.chunk_size()), mapped);
+    vmm_multi_unmap(&rkey_b, cu_dev, mapped, region, 0);
+
+    vmm_multi_unmap(&rkey_a, cu_dev, mapped_a, region_a, 0);
+    vmm_multi_unmap(&rkey_b, cu_dev, mapped_b, region_b, 0);
+    vmm_multi_unmap(&rkey_c, cu_dev, mapped_c, region_c, 0);
+    mem_dereg(memh);
+#else
+    UCS_TEST_SKIP_R("built without fabric support");
+#endif
+}
+
 UCS_TEST_P(test_cuda_ipc_md, posix_fd_same_node_ipc)
 {
 #if HAVE_DECL_SYS_PIDFD_GETFD
@@ -782,9 +969,11 @@ UCS_TEST_P(test_cuda_ipc_md, posix_fd_same_node_ipc)
 
             uct_cuda_ipc_unpacked_rkey_t *unpacked =
                     (uct_cuda_ipc_unpacked_rkey_t*)rkey_bundle.rkey;
+            uct_cuda_ipc_cache_region_t *cache_region;
             void *mapped_addr;
             ucs_status_t map_status = uct_cuda_ipc_map_memhandle(
-                    &unpacked->super, dev, &mapped_addr, UCS_LOG_LEVEL_ERROR);
+                    &unpacked->super, dev, &mapped_addr, &cache_region,
+                    UCS_LOG_LEVEL_ERROR);
             ASSERT_UCS_OK(map_status);
 
             std::vector<uint8_t> host_buf(size);
@@ -797,7 +986,7 @@ UCS_TEST_P(test_cuda_ipc_md, posix_fd_same_node_ipc)
 
             uct_cuda_ipc_mapping_t mapping;
             uct_cuda_ipc_mapping_init(&mapping, &unpacked->super,
-                                      mapped_addr);
+                                      mapped_addr, cache_region);
             uct_cuda_ipc_unmap_memhandle(&mapping, dev, 0);
             EXPECT_UCS_OK(uct_rkey_release(component, &rkey_bundle));
             EXPECT_EQ(cuCtxDestroy(ctx), CUDA_SUCCESS);
